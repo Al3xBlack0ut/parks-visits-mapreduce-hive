@@ -6,7 +6,7 @@ USE default;
 DROP TABLE IF EXISTS mr_park_visits;
 CREATE EXTERNAL TABLE mr_park_visits (
   park_id STRING,
-  \`date\` STRING,
+  `date` STRING,
   visits_count BIGINT,
   avg_group_size DOUBLE,
   sum_group_size BIGINT
