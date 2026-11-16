@@ -1,64 +1,89 @@
-# Park Visits Analytics with Hadoop MapReduce, Apache Hive and Airflow
+# Analiza odwiedzin parków - Hadoop MapReduce, Hive i Airflow
 
-A batch data-processing pipeline that aggregates synthetic national-park visit records with **Python Hadoop Streaming**, then enriches and analyses the results in **Apache Hive**. An **Apache Airflow** DAG orchestrates the HDFS cleanup, MapReduce job, Hive aggregation and result extraction.
+Projekt przedstawia potok przetwarzania danych o wizytach w parkach. W pierwszym etapie dane są agregowane z użyciem **Apache Hadoop MapReduce Streaming** i skryptów w **Pythonie**. Następnie wyniki są łączone z metadanymi parków i analizowane w **Apache Hive**. Całość może być uruchamiana i koordynowana przez **Apache Airflow**.
 
-## Pipeline overview
+## Przepływ przetwarzania
 
-```text
-Synthetic CSV visits                         Parks dimension CSV
-        |                                             |
-        v                                             |
-Python Mapper                                      |
-        |                                           |
-        v                                           |
-Combiner (sum group sizes and visit counts)          |
-        |                                           |
-        v                                           |
-Reducer (daily park-level aggregates)                |
-        |                                           |
-        +--------------------+----------------------+
-                             |
-                             v
-                    Apache Hive join
-                             |
-              EXPLODE nature_types and aggregate
-                             |
-                  Window-based deviation
-                             |
-                             v
-                     JSON result in HDFS
+Diagram przedstawia kolejność operacji oraz rolę poszczególnych narzędzi:
+
+```mermaid
+flowchart TD
+    A["Dane o wizytach<br/>CSV"] --> B["Mapper<br/>Python / Hadoop Streaming"]
+    B --> C["Combiner<br/>częściowa agregacja"]
+    C --> D["Reducer<br/>agregacja według parku i dnia"]
+    D --> E[("HDFS<br/>wyniki MapReduce")]
+
+    F["Metadane parków<br/>CSV"] --> G["Apache Hive<br/>JOIN"]
+    E --> G
+    G --> H["LATERAL VIEW EXPLODE<br/>rozdzielenie typów przyrody"]
+    H --> I["Agregacja według typu przyrody i regionu"]
+    I --> J["Funkcja okna<br/>porównanie z wartością średnią"]
+    J --> K[("HDFS<br/>wynik JSON")]
+
+    L["Apache Airflow"] -. "koordynuje zadania" .-> M["Czyszczenie katalogów wynikowych"]
+    M -. "uruchamia" .-> B
+    M -. "przygotowuje" .-> G
+    K --> N["Pobranie wyników"]
 ```
 
-## What it calculates
+## 1. Agregacja danych - Hadoop MapReduce
 
-### Stage 1 - Hadoop MapReduce
+Skrypty MapReduce przetwarzają rekordy wizyt i grupują je według identyfikatora parku oraz daty wejścia (`entry_time`).
 
-For each `(park_id, date)` pair, the mapper extracts the visit date from `entry_time` and emits the group size and a visit counter. The combiner and reducer sum these distributive components. The reducer outputs:
+- **Mapper** odczytuje pliki CSV, wyznacza dzień wizyty i emituje identyfikator parku, datę, wielkość grupy oraz licznik rekordu.
+- **Combiner** wykonuje częściowe sumowanie liczby osób i liczby wizyt przed przekazaniem danych do Reducera.
+- **Reducer** łączy częściowe wyniki i wyznacza dzienne statystyki dla każdego parku.
 
-- `park_id`
-- `date`
-- `visits_count`
-- `avg_group_size`
-- `sum_group_size` (retained so the Hive stage can calculate a correctly weighted average)
+Wynik zawiera pola:
 
-The job uses a Python mapper, combiner and reducer through Hadoop Streaming.
+| Pole | Znaczenie |
+|---|---|
+| `park_id` | identyfikator parku |
+| `date` | dzień wizyty |
+| `visits_count` | liczba wizyt |
+| `avg_group_size` | średnia wielkość grupy dla danego dnia i parku |
+| `sum_group_size` | suma wielkości grup, potrzebna do dalszego obliczenia średniej ważonej |
 
-### Stage 2 - Apache Hive
+Do uruchomienia skryptów w klastrze wykorzystywany jest Hadoop Streaming.
 
-Hive joins the daily aggregates with the parks dimension table, splits multi-valued `nature_types` using `LATERAL VIEW EXPLODE`, and groups the data by nature type and region. It calculates total visits, a weighted average group size and the difference between a region's visit count and the average for that nature type across represented regions using a window function.
+## 2. Analiza danych - Apache Hive
 
-The final output contains `nature_type`, `region`, `total_visits`, `avg_group_size` and `visits_deviation`.
+Hive łączy dzienne wyniki MapReduce z tabelą zawierającą metadane parków. Następnie:
 
-## Technologies
+1. Rozdziela wielowartościowe pole `nature_types` przy użyciu `LATERAL VIEW EXPLODE`.
+2. Grupuje dane według typu przyrody i regionu.
+3. Oblicza łączną liczbę wizyt oraz średnią wielkość grupy. Średnia jest liczona na podstawie sum i liczności, dzięki czemu zachowuje wagi poszczególnych dni.
+4. Wykorzystuje funkcję okna do porównania liczby wizyt w regionie ze średnią dla danego typu przyrody.
 
-- Python 3: Hadoop Streaming mapper, combiner and reducer
-- Apache Hadoop: HDFS and MapReduce Streaming
-- Apache Hive: external tables, joins, `LATERAL VIEW EXPLODE`, aggregations and window functions
-- Apache Airflow: workflow orchestration with BashOperator
-- CSV and JSON data formats
-- Bash
+Wynik końcowy jest zapisywany w formacie JSON w HDFS i zawiera:
 
-## Repository structure
+- `nature_type` - typ przyrody,
+- `region` - region,
+- `total_visits` - łączną liczbę wizyt,
+- `avg_group_size` - średnią wielkość grupy,
+- `visits_deviation` - różnicę między liczbą wizyt w regionie a średnią dla danego typu przyrody.
+
+## 3. Orkiestracja - Apache Airflow
+
+DAG w Airflow koordynuje kolejne kroki potoku:
+
+1. Usunięcie poprzednich katalogów wynikowych w HDFS.
+2. Uruchomienie zadania Hadoop MapReduce.
+3. Uruchomienie zapytania Hive.
+4. Pobranie i wyświetlenie fragmentu końcowego pliku JSON.
+
+Ścieżki wejściowe i wyjściowe są parametryzowane w konfiguracji DAG-a, dzięki czemu można je dostosować do środowiska uruchomieniowego.
+
+## Wykorzystane technologie
+
+- **Python 3** - implementacja Mapper, Combiner i Reducer.
+- **Apache Hadoop** - HDFS oraz MapReduce Streaming.
+- **Apache Hive** - tabele zewnętrzne, JOIN, agregacje, `LATERAL VIEW EXPLODE` i funkcje okna.
+- **Apache Airflow** - orkiestracja zadań przy użyciu `BashOperator`.
+- **Bash** - skrypty uruchomieniowe.
+- **CSV i JSON** - formaty danych wejściowych i wynikowych.
+
+## Struktura repozytorium
 
 ```text
 .
@@ -84,36 +109,41 @@ The final output contains `nature_type`, `region`, `total_visits`, `avg_group_si
     └── test_mapreduce.py
 ```
 
-## Data
+## Dane wejściowe
 
-The source datasets were synthetically generated with [Datafaker](https://www.datafaker.net/). The repository contains a small visit sample and the parks dimension table so the schemas and processing logic are easy to inspect. The complete multi-file visit dataset is intentionally not included in this portfolio repository.
+Dane źródłowe zostały wygenerowane syntetycznie przy użyciu [Datafaker](https://www.datafaker.net/). Repozytorium zawiera niewielką próbkę danych o wizytach oraz tabelę wymiaru parków, aby można było zapoznać się ze strukturą danych i logiką przetwarzania. Pełny zbiór danych, przekraczający 100 MB, nie jest częścią repozytorium.
 
-`datasource1` contains visit records with `visit_id`, `park_id`, `visitor_id`, `entry_time`, `exit_time`, `group_size` and `activity`.
+Zbiór wizyt (`datasource1`) zawiera pola:
 
-`datasource4` contains park metadata, including `park_id`, `region` and the semicolon-separated `nature_types` field.
+- `visit_id`,
+- `park_id`,
+- `visitor_id`,
+- `entry_time`,
+- `exit_time`,
+- `group_size`,
+- `activity`.
 
-## Requirements
+Zbiór metadanych parków (`datasource4`) zawiera m.in. `park_id`, `region` oraz pole `nature_types`, w którym typy przyrody są rozdzielone średnikami.
 
-The distributed pipeline expects an environment with:
+## Wymagania środowiskowe
 
-- Apache Hadoop with HDFS and the `mapred streaming` command available
-- Apache Hive with HiveServer2/Beeline
-- OpenCSV and Hive HCatalog libraries available to Hive
-- Apache Airflow with the standard provider installed (for the DAG)
-- Python 3 on Hadoop worker nodes
+Do uruchomienia pełnego, rozproszonego potoku potrzebne są:
 
-The Airflow DAG uses the Airflow 3-style `airflow.sdk.Param` interface. Hadoop, Hive and Airflow must be configured in the execution environment; this repository does not bundle those services.
+- Apache Hadoop z HDFS i poleceniem `mapred streaming`,
+- Apache Hive oraz HiveServer2/Beeline,
+- biblioteki OpenCSV i Hive HCatalog dostępne dla Hive,
+- Apache Airflow z dostawcą standardowych operatorów,
+- Python 3 dostępny na węzłach wykonujących zadania Hadoop.
 
-## Run the MapReduce stage
+DAG korzysta z interfejsu `airflow.sdk.Param` dostępnego w Airflow 3. Hadoop, Hive i Airflow muszą być wcześniej skonfigurowane w środowisku. Repozytorium nie zawiera tych usług ani ich konfiguracji infrastrukturalnej.
 
-Copy the sample input to HDFS. The directory layout expected by the DAG and the scripts is:
+## Uruchomienie
 
-```text
-/project1/input/datasource1
-/project1/input/datasource4
-```
+Poniższe polecenia zakładają, że Hadoop, HDFS i Hive są już uruchomione, a polecenia `hadoop`, `mapred` oraz `beeline` są dostępne w systemie.
 
-For example:
+### 1. Przygotowanie danych w HDFS
+
+Utwórz katalogi i skopiuj przykładowe pliki:
 
 ```bash
 hadoop fs -mkdir -p /project1/input/datasource1 /project1/input/datasource4
@@ -121,15 +151,15 @@ hadoop fs -put input/sample/datasource1/visits_sample.csv /project1/input/dataso
 hadoop fs -put input/sample/datasource4/parks.csv /project1/input/datasource4/
 ```
 
-Run Hadoop Streaming:
+### 2. Uruchomienie MapReduce
 
 ```bash
 bash project_files/run_mr.sh /project1/input/datasource1 /project1/output_mr3
 ```
 
-## Run the Hive stage
+### 3. Uruchomienie Hive
 
-After MapReduce has completed:
+Po zakończeniu zadania MapReduce uruchom agregację w Hive:
 
 ```bash
 bash project_files/run_hive.sh \
@@ -138,29 +168,33 @@ bash project_files/run_hive.sh \
   /project1/output6
 ```
 
-The Hive script writes the final JSON output to the configured HDFS location.
+Wynik zostanie zapisany w skonfigurowanym katalogu HDFS w formacie JSON.
 
-## Run with Airflow
+### 4. Uruchomienie przez Airflow
 
-Place `airflow/dags/parks_visits_dag.py` in the Airflow DAGs directory and copy `project_files/` into a sibling directory named `project_files` inside that DAGs directory. The default DAG parameters assume:
+Umieść plik `airflow/dags/parks_visits_dag.py` w katalogu DAG-ów Airflow. Katalog `project_files/` należy umieścić obok niego, tak aby domyślna ścieżka `/opt/airflow/dags/project_files` wskazywała na skrypty i plik HiveQL.
 
-- `project_files_dir`: `/opt/airflow/dags/project_files`
-- `input_dir`: `/project1/input`
-- `output_mr_dir`: `/project1/output_mr3`
-- `output_dir`: `/project1/output6`
+Domyślne parametry DAG-a:
 
-Override the DAG parameters when your environment uses different paths. The Airflow workers must be able to call Hadoop and Beeline and reach the configured HDFS and Hive services.
+| Parametr | Domyślna wartość |
+|---|---|
+| `project_files_dir` | `/opt/airflow/dags/project_files` |
+| `input_dir` | `/project1/input` |
+| `output_mr_dir` | `/project1/output_mr3` |
+| `output_dir` | `/project1/output6` |
 
-## Tests
+W razie potrzeby można zmienić wartości parametrów przy uruchamianiu DAG-a. Worker Airflow musi mieć dostęp do poleceń Hadoop i Beeline oraz do usług HDFS i Hive.
 
-The MapReduce components can be smoke-tested locally without Hadoop or Hive:
+## Testy
+
+Logikę Mapper, Combiner i Reducer można sprawdzić lokalnie, bez uruchamiania klastra Hadoop i Hive:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The test runs the mapper, combiner and reducer over a small CSV fixture and checks the daily park aggregates. It does not execute the distributed Hadoop job or the Hive query.
+Test uruchamia trzy skrypty na niewielkim pliku fixture i sprawdza dzienne agregaty wizyt. Nie jest to test integracyjny klastra: nie uruchamia Hadoop Streaming ani zapytania Hive.
 
-## Scope
+## Zakres repozytorium
 
-This repository focuses on the data-processing implementation. Course handouts, grading rubrics, IDE metadata, generated bytecode, intermediate result dumps and the full 100+ MB source dataset are not included.
+Repozytorium zawiera kod przetwarzania, DAG Airflow, przykładowe dane i test logiki MapReduce. Nie zawiera pełnego zbioru źródłowego (ponad 100 MB), materiałów kursowych, kryteriów oceniania, konfiguracji IDE, plików tymczasowych ani wygenerowanych wyników pośrednich.
