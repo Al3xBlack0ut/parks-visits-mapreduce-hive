@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+.airflowignore
+logs/
+output/
+output_mr3/
+output6/
+output6.json
